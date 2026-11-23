@@ -63,6 +63,7 @@ function Get-CIPPSPOSiteBulk {
     $TokenSplat = @{ tenantid = $TenantFilter; scope = "$AdminUrl/.default" }
     if ($UseCertificate) { $TokenSplat['AsApp'] = $true; $TokenSplat['UseCertificate'] = $true }
     $Authorization = (Get-GraphToken @TokenSplat).Authorization
+    $UserAgent = Get-CippUserAgent -SharePoint
 
     if ($BatchSize -lt 1) { $BatchSize = 1 }
     $CleanUrls = @($SiteUrls | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -101,13 +102,14 @@ function Get-CIPPSPOSiteBulk {
         $Headers = [System.Collections.Generic.Dictionary[string, string]]::new()
         $Headers['Authorization'] = $Authorization
         $Headers['Accept'] = 'application/json;odata=verbose'
+        $Headers['User-Agent'] = $UserAgent
         $Request.Headers = $Headers
 
         $Requests.Add($Request)
         $BatchUrls.Add($Chunk)
     }
 
-    $Results = [CIPP.CIPPRestClient]::SendConcurrent($Requests, $MaxConcurrency, $MaxRetries)
+    $Results = [CIPP.CIPPRestClient]::SendConcurrent($Requests, $MaxConcurrency, $MaxRetries, ($PSCmdlet.PipelineStopToken ?? $global:CraftPipelineStopToken))
 
     @(foreach ($Result in $Results) {
             $Chunk = $BatchUrls[$Result.Index]

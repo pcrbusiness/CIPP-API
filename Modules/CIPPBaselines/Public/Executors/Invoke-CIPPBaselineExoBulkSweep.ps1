@@ -15,7 +15,9 @@ function Invoke-CIPPBaselineExoBulkSweep {
                       engine projects Current down to the expected keys before comparing.
 
         Spec (fully rendered):
-          writes[]      - ordered groups, each { from, cmdlet, params, compliance }. 'from'
+          writes[]      - ordered groups, each { from, cmdlet, params, compliance, concurrency }.
+                          'concurrency' (default 16, capped at 32) is how many 10-cmdlet batches run at once;
+                          CIPPRateLimiter holds EXO to 45 requests/s and its Rate-Limit budget. 'from'
                           names the property on -Current holding the objects (default
                           'targets'); a group naming a property that does not exist is an
                           authoring error and throws, one that exists and is empty is nothing
@@ -41,17 +43,6 @@ function Invoke-CIPPBaselineExoBulkSweep {
         $Current
     )
 
-    $Expand = {
-        param($Template, $Object)
-        $Json = ConvertTo-Json -Compress -Depth 100 -InputObject $Template
-        foreach ($Property in $Object.PSObject.Properties) {
-            $Token = '%{0}%' -f $Property.Name
-            $Json = $Json.Replace(('"{0}"' -f $Token), (ConvertTo-Json -Compress -Depth 100 -InputObject $Property.Value))
-            $Json = $Json.Replace($Token, "$($Property.Value)")
-        }
-        $Json | ConvertFrom-Json
-    }
-
     $Attempted = 0
     $Failed = 0
     $FailureDetail = [System.Collections.Generic.List[string]]::new()
@@ -69,7 +60,7 @@ function Invoke-CIPPBaselineExoBulkSweep {
 
         $Requests = foreach ($Object in $Objects) {
             $Parameters = @{}
-            foreach ($Property in (& $Expand ($Write.params ?? [PSCustomObject]@{}) $Object).PSObject.Properties) {
+            foreach ($Property in (Expand-CIPPBaselineToken -Template ($Write.params ?? [PSCustomObject]@{}) -Values $Object).PSObject.Properties) {
                 $Parameters[$Property.Name] = $Property.Value
             }
             @{
@@ -79,7 +70,7 @@ function Invoke-CIPPBaselineExoBulkSweep {
         }
 
         $Attempted += $Objects.Count
-        $Results = @(New-ExoBulkRequest -tenantid $TenantFilter -cmdletArray @($Requests) -useSystemMailbox $true -Compliance:([bool]($Write.compliance ?? $false)))
+        $Results = @(New-ExoBulkRequest -tenantid $TenantFilter -cmdletArray @($Requests) -useSystemMailbox $true -Compliance:([bool]($Write.compliance ?? $false)) -MaxConcurrency ([Math]::Max(1, [int]($Write.concurrency ?? 16))))
         foreach ($Result in $Results) {
             if ($Result.error) {
                 $Failed++

@@ -231,9 +231,10 @@ namespace CIPP
     //   SPO             5   *.sharepoint.com CSOM/_api (concurrent per-site fan-out)
     //   DNS             2   dns.google.com, cloudflare-dns.com (per host)
     //   NinjaOne       12   *.ninjarmm.com, *.ninjaone.com (tenant sync fan-out)
+    //   Syncro          5   *.syncromsp.com (PSA tickets, customer mapping)
     //   Default         5   catch-all + absorbs legacy Invoke-RestMethod calls
     //   ─────────────
-    //   Total          96   leaves a 29-port buffer for the Functions host,
+    //   Total         101   leaves a 24-port buffer for the Functions host,
     //                       Durable extension, AppInsights, Azure SDK clients,
     //                       and any stragglers that bypass the pool.
     //
@@ -288,6 +289,7 @@ namespace CIPP
         private static HttpClient? _spoClient;
         private static HttpClient? _dnsClient;
         private static HttpClient? _ninjaOneClient;
+        private static HttpClient? _syncroClient;
         private static HttpClient? _defaultClient;
 
         /// <summary>
@@ -310,6 +312,8 @@ namespace CIPP
         private static readonly ConcurrentDictionary<string, long> _hostSelections =
             new(StringComparer.OrdinalIgnoreCase);
         private static readonly ConcurrentDictionary<int, long> _statusCodes = new();
+        private const int MaxTrackedHosts = 500;
+        private static int _trackedHosts;
 
         // -----------------------------------------------------------------
         // Client factory helpers
@@ -323,9 +327,9 @@ namespace CIPP
         //     graceful-recycle churn and cuts the TIME_WAIT tail under steady
         //     load — a small but measurable port saving.
         //
-        //   PooledConnectionIdleTimeout  2 min — idle connections that have
-        //     not been used for 2 minutes are closed and removed from the
-        //     pool. Keeps the pool lean during quiet periods.
+        //   PooledConnectionIdleTimeout  3 min — idle connections are closed
+        //     before the Azure SNAT silently drops an idle flow at 4 minutes,
+        //     so a pooled connection is never reused after its mapping is gone.
         //
         //   MaxConnectionsPerServer — hard cap on simultaneous TCP connections
         //     to a single host:port pair. Requests beyond this limit queue
@@ -352,7 +356,7 @@ namespace CIPP
         {
             AutomaticDecompression         = DecompressionMethods.All,
             PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
-            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(3),
             EnableMultipleHttp2Connections = true,   // Graph supports HTTP/2; streams share connections
             AllowAutoRedirect              = true,
             MaxAutomaticRedirections       = 10,
@@ -370,7 +374,7 @@ namespace CIPP
         {
             AutomaticDecompression         = DecompressionMethods.All,
             PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
-            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(3),
             EnableMultipleHttp2Connections = true,
             AllowAutoRedirect              = true,
             MaxAutomaticRedirections       = 10,
@@ -388,7 +392,7 @@ namespace CIPP
         {
             AutomaticDecompression         = DecompressionMethods.All,
             PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
-            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(3),
             EnableMultipleHttp2Connections = false,
             AllowAutoRedirect              = true,
             MaxAutomaticRedirections       = 5,
@@ -408,7 +412,7 @@ namespace CIPP
         {
             AutomaticDecompression         = DecompressionMethods.All,
             PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
-            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(3),
             EnableMultipleHttp2Connections = false,
             AllowAutoRedirect              = false,  // 3xx IS the expected response here
             MaxConnectionsPerServer        = MaxConn("ComplianceMaxConnectionsPerServer", 5),
@@ -424,7 +428,7 @@ namespace CIPP
         {
             AutomaticDecompression         = DecompressionMethods.All,
             PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
-            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(3),
             EnableMultipleHttp2Connections = true,
             AllowAutoRedirect              = true,
             MaxAutomaticRedirections       = 10,
@@ -440,7 +444,7 @@ namespace CIPP
         {
             AutomaticDecompression         = DecompressionMethods.All,
             PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
-            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(3),
             EnableMultipleHttp2Connections = true,
             AllowAutoRedirect              = true,
             MaxAutomaticRedirections       = 10,
@@ -450,19 +454,17 @@ namespace CIPP
         /// <summary>
         /// SharePoint / OneDrive client — dedicated lane for SPO admin CSOM (ProcessQuery) and
         /// SPO REST (_api) against *.sharepoint.com, which have no server-side $batch. Concurrent
-        /// per-site writes (Set-CIPPSPOSiteBulk via SendConcurrent) fan out here. HTTP/2 is disabled
-        /// so MaxConnectionsPerServer is a true concurrency ceiling (5) rather than a connection count
-        /// that H2 stream-multiplexing could exceed. Measured on a 526-site tenant, 5 in flight throttled
-        /// far less than 8-10 (43 vs 56 x HTTP 429) and finished sooner — SPO's CSOM-admin throttle is a
-        /// sustained-rate limit, so a lower ceiling plus the once-per-24h sweep guard is the throttle-safe
-        /// combination. Cap: 5 connections.
+        /// per-site writes (Set-CIPPSPOSiteBulk via SendConcurrent) fan out here. HTTP/2 multiplexes them
+        /// on one connection per host, so the cap counts sockets; in-flight requests are bounded by each
+        /// caller's MaxConcurrency and paced per tenant by CIPPRateLimiter's sharepoint bucket.
+        /// Cap: 5 connections.
         /// </summary>
         private static HttpClient BuildSpoClient() => new HttpClient(new SocketsHttpHandler
         {
             AutomaticDecompression         = DecompressionMethods.All,
             PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
-            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
-            EnableMultipleHttp2Connections = false,
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(3),
+            EnableMultipleHttp2Connections = true,
             AllowAutoRedirect              = true,
             MaxAutomaticRedirections       = 10,
             MaxConnectionsPerServer        = MaxConn("SpoMaxConnectionsPerServer", 5),
@@ -479,7 +481,7 @@ namespace CIPP
         {
             AutomaticDecompression         = DecompressionMethods.All,
             PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
-            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(3),
             EnableMultipleHttp2Connections = false,
             AllowAutoRedirect              = true,
             MaxAutomaticRedirections       = 5,
@@ -490,17 +492,35 @@ namespace CIPP
         /// NinjaOne client — *.ninjarmm.com / *.ninjaone.com. The tenant sync fans out
         /// per-device and per-document writes, and NinjaOne scales close to linearly with
         /// concurrency (300 device PATCHes: 98s at 1 in flight, 12s at 8, 6s at 16), so it gets its own
-        /// lane instead of queueing behind the 5-connection catch-all. Cap: 12 connections.
+        /// lane instead of queueing behind the 5-connection catch-all. HTTP/2 multiplexes every tenant
+        /// sync's requests on one connection per host (34 concurrent document PATCHes shared one), so
+        /// the cap counts sockets and in-flight requests are bounded by each caller's concurrency.
+        /// Cap: 12 connections.
         /// </summary>
         private static HttpClient BuildNinjaOneClient() => new HttpClient(new SocketsHttpHandler
         {
             AutomaticDecompression         = DecompressionMethods.All,
             PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
-            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
-            EnableMultipleHttp2Connections = false,
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(3),
+            EnableMultipleHttp2Connections = true,
             AllowAutoRedirect              = true,
             MaxAutomaticRedirections       = 10,
             MaxConnectionsPerServer        = MaxConn("NinjaOneMaxConnectionsPerServer", 12),
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        /// <summary>
+        /// Syncro client — *.syncromsp.com. Kept off the catch-all so PSA ticket creation does not
+        /// queue behind other third-party traffic. Cap: 5 connections.
+        /// </summary>
+        private static HttpClient BuildSyncroClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(3),
+            EnableMultipleHttp2Connections = true,
+            AllowAutoRedirect              = true,
+            MaxAutomaticRedirections       = 10,
+            MaxConnectionsPerServer        = MaxConn("SyncroMaxConnectionsPerServer", 5),
         }) { Timeout = Timeout.InfiniteTimeSpan };
 
         /// <summary>
@@ -515,7 +535,7 @@ namespace CIPP
         {
             AutomaticDecompression         = DecompressionMethods.All,
             PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
-            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(3),
             EnableMultipleHttp2Connections = true,
             AllowAutoRedirect              = true,
             MaxAutomaticRedirections       = 10,
@@ -542,6 +562,7 @@ namespace CIPP
                 _spoClient        is not null &&
                 _dnsClient        is not null &&
                 _ninjaOneClient   is not null &&
+                _syncroClient     is not null &&
                 _defaultClient    is not null)
                 return;
 
@@ -560,6 +581,7 @@ namespace CIPP
                     _spoClient        = BuildSpoClient();
                     _dnsClient        = BuildDnsClient();
                     _ninjaOneClient   = BuildNinjaOneClient();
+                    _syncroClient     = BuildSyncroClient();
                     _defaultClient    = BuildDefaultClient();
                 }
             }
@@ -659,6 +681,8 @@ namespace CIPP
                 var h when h.EndsWith(".ninjarmm.com", StringComparison.OrdinalIgnoreCase)
                         || h.EndsWith(".ninjaone.com", StringComparison.OrdinalIgnoreCase) => (_ninjaOneClient!, "NinjaOne", host),
 
+                var h when h.EndsWith(".syncromsp.com", StringComparison.OrdinalIgnoreCase) => (_syncroClient!, "Syncro", host),
+
                 // Rule 8 — catch-all
                 _                                                           => (_defaultClient!, "Default", host),
             };
@@ -678,7 +702,13 @@ namespace CIPP
         private static void TrackPoolSelection(string pool, string host)
         {
             _poolSelections.AddOrUpdate(pool, 1, static (_, current) => current + 1);
-            _hostSelections.AddOrUpdate(host, 1, static (_, current) => current + 1);
+            // SharePoint and extension hosts are per tenant, so new hosts past the cap share one row.
+            if (Volatile.Read(ref _trackedHosts) >= MaxTrackedHosts && !_hostSelections.ContainsKey(host))
+                host = "(other)";
+            if (_hostSelections.TryAdd(host, 1))
+                Interlocked.Increment(ref _trackedHosts);
+            else
+                _hostSelections.AddOrUpdate(host, 1, static (_, current) => current + 1);
         }
 
         private static void TrackPoolResult(string pool, bool success, int statusCode)
@@ -712,10 +742,11 @@ namespace CIPP
             string?                     contentType        = null,
             bool                        skipErrorCheck     = false,
             int                         timeoutSec         = 100,
-            int                         maximumRedirection = -1)
+            int                         maximumRedirection = -1,
+            CancellationToken?          cancellationToken  = null)
         {
             return SendAsync(uri, method, body, headers, contentType,
-                             skipErrorCheck, timeoutSec, maximumRedirection)
+                             skipErrorCheck, timeoutSec, maximumRedirection, cancellationToken ?? default)
                    .GetAwaiter().GetResult();
         }
 
@@ -730,7 +761,8 @@ namespace CIPP
             string?                     contentType        = null,
             bool                        skipErrorCheck     = false,
             int                         timeoutSec         = 100,
-            int                         maximumRedirection = -1)
+            int                         maximumRedirection = -1,
+            CancellationToken           cancellationToken  = default)
         {
             await EnsureClientsAsync().ConfigureAwait(false);
 
@@ -745,12 +777,19 @@ namespace CIPP
             var rateWaited = TimeSpan.Zero;
             while (rateWait > TimeSpan.Zero && rateWaited < CIPPRateLimiter.MaxWait)
             {
-                await Task.Delay(rateWait).ConfigureAwait(false);
+                await Task.Delay(rateWait, cancellationToken).ConfigureAwait(false);
                 rateWaited += rateWait;
                 rateWait = CIPPRateLimiter.Recheck(rateClaim);
             }
 
             using var request = new HttpRequestMessage(new HttpMethod(method), new Uri(uri));
+            // A request defaults to HTTP/1.1, so EnableMultipleHttp2Connections alone never multiplexes.
+            // These are the lanes that enable it; a host without h2 falls back to 1.1 in the TLS handshake.
+            if (selection.Pool is "Graph" or "Exo" or "PartnerCenter" or "AdminPlane" or "SPO" or "NinjaOne" or "Syncro" or "Default")
+            {
+                request.Version       = HttpVersion.Version20;
+                request.VersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
+            }
 
             // ----------------------------------------------------------
             // Headers
@@ -828,10 +867,9 @@ namespace CIPP
             // Instead we create a CancellationTokenSource per request with the
             // caller-specified timeout. timeoutSec = 0 means no timeout.
             // ----------------------------------------------------------
-            using var cts = timeoutSec > 0
-                ? new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSec))
-                : null;
-            var token = cts?.Token ?? CancellationToken.None;
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            if (timeoutSec > 0) cts.CancelAfter(TimeSpan.FromSeconds(timeoutSec));
+            var token = cts.Token;
 
             // ----------------------------------------------------------
             // Send
@@ -846,7 +884,11 @@ namespace CIPP
                 // defensive body read below — masking the HTTP status the caller needs.
                 response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (cts is not null && cts.IsCancellationRequested)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
             {
                 // Our per-request timeout CTS actually fired — this is a genuine
                 // client-side timeout after timeoutSec. Let it propagate as an
@@ -893,7 +935,7 @@ namespace CIPP
                     else
                         content = string.Empty;
                 }
-                catch (Exception ex) when (ex is InvalidDataException || ex is IOException)
+                catch (Exception ex) when ((ex is InvalidDataException || ex is IOException) && !cancellationToken.IsCancellationRequested)
                 {
                     if (!(skipErrorCheck || noRedirect))
                     {
@@ -974,16 +1016,18 @@ namespace CIPP
         public static CIPPConcurrentResult[] SendConcurrent(
             IEnumerable<CIPPConcurrentRequest> requests,
             int maxConcurrency = 8,
-            int maxRetries     = 3)
+            int maxRetries     = 3,
+            CancellationToken? cancellationToken = null)
         {
-            return SendConcurrentAsync(requests, maxConcurrency, maxRetries)
+            return SendConcurrentAsync(requests, maxConcurrency, maxRetries, cancellationToken ?? default)
                    .GetAwaiter().GetResult();
         }
 
         public static async Task<CIPPConcurrentResult[]> SendConcurrentAsync(
             IEnumerable<CIPPConcurrentRequest> requests,
             int maxConcurrency = 8,
-            int maxRetries     = 3)
+            int maxRetries     = 3,
+            CancellationToken cancellationToken = default)
         {
             var list = requests is null ? new List<CIPPConcurrentRequest>() : requests.ToList();
             if (list.Count == 0) return Array.Empty<CIPPConcurrentResult>();
@@ -998,8 +1042,8 @@ namespace CIPP
                 var req   = list[i];
                 tasks[i] = Task.Run(async () =>
                 {
-                    await gate.WaitAsync().ConfigureAwait(false);
-                    try   { return await SendOneWithRetryAsync(index, req, maxRetries).ConfigureAwait(false); }
+                    await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try   { return await SendOneWithRetryAsync(index, req, maxRetries, cancellationToken).ConfigureAwait(false); }
                     finally { gate.Release(); }
                 });
             }
@@ -1007,7 +1051,7 @@ namespace CIPP
         }
 
         private static async Task<CIPPConcurrentResult> SendOneWithRetryAsync(
-            int index, CIPPConcurrentRequest req, int maxRetries)
+            int index, CIPPConcurrentRequest req, int maxRetries, CancellationToken cancellationToken)
         {
             var attempt = 0;
             while (true)
@@ -1020,12 +1064,13 @@ namespace CIPP
                     var res = await SendAsync(req.Uri, req.Method, req.Body, req.Headers,
                                               req.ContentType, skipErrorCheck: true,
                                               timeoutSec: req.TimeoutSec,
-                                              maximumRedirection: req.MaximumRedirection).ConfigureAwait(false);
+                                              maximumRedirection: req.MaximumRedirection,
+                                              cancellationToken: cancellationToken).ConfigureAwait(false);
 
                     var retryable = res.StatusCode == 429 || (res.StatusCode >= 500 && res.StatusCode <= 599);
                     if (retryable && attempt <= maxRetries)
                     {
-                        await Task.Delay(RetryDelay(res, attempt)).ConfigureAwait(false);
+                        await Task.Delay(RetryDelay(res, attempt), cancellationToken).ConfigureAwait(false);
                         continue;
                     }
                     return new CIPPConcurrentResult
@@ -1034,11 +1079,11 @@ namespace CIPP
                         Result = res, Attempts = attempt,
                     };
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
                 {
                     if (attempt <= maxRetries)
                     {
-                        await Task.Delay(RetryDelay(null, attempt)).ConfigureAwait(false);
+                        await Task.Delay(RetryDelay(null, attempt), cancellationToken).ConfigureAwait(false);
                         continue;
                     }
                     return new CIPPConcurrentResult
@@ -1202,6 +1247,7 @@ namespace CIPP
             _poolFailures.Clear();
             _poolTransportErrors.Clear();
             _hostSelections.Clear();
+            Interlocked.Exchange(ref _trackedHosts, 0);
             _statusCodes.Clear();
         }
     }
@@ -1238,6 +1284,9 @@ namespace CIPP
         // only one acquires a token while the others wait and reuse the result.
         private static readonly ConcurrentDictionary<string, SemaphoreSlim> _keyLocks =
             new(StringComparer.OrdinalIgnoreCase);
+
+        private const int MaxEntries = 10000;
+        private const int SweepEvery = 256;
 
         private static long _hits;
         private static long _misses;
@@ -1308,7 +1357,29 @@ namespace CIPP
                 CachedAtUnix     = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
             };
 
-            Interlocked.Increment(ref _sets);
+            if (Interlocked.Increment(ref _sets) % SweepEvery == 0)
+                Sweep();
+        }
+
+        // Domain and GUID forms of a tenant, per-site SharePoint scopes and "|failed" markers are often never
+        // looked up again, so expiry on lookup alone never frees them.
+        private static void Sweep()
+        {
+            CompactExpired(0, int.MaxValue);
+            // Taking the lock first means no caller holds it; AcquireLock retries if it waited on a removed one.
+            foreach (var kvp in _keyLocks)
+            {
+                if (_entries.ContainsKey(kvp.Key) || !kvp.Value.Wait(0))
+                    continue;
+                _keyLocks.TryRemove(kvp);
+                kvp.Value.Release();
+            }
+            var excess = _entries.Count - (MaxEntries - SweepEvery);
+            if (excess <= 0)
+                return;
+            foreach (var kvp in _entries.ToArray().OrderBy(e => e.Value.ExpiresOnUnix).Take(excess))
+                if (_entries.TryRemove(kvp.Key, out _))
+                    Interlocked.Increment(ref _expiredRemovals);
         }
 
         public static void Remove(string key)
@@ -1402,9 +1473,17 @@ namespace CIPP
             if (string.IsNullOrWhiteSpace(key))
                 return false;
 
-            var sem = _keyLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
             Interlocked.Increment(ref _lockWaits);
-            return sem.Wait(timeoutMs);
+            var deadline = Environment.TickCount64 + timeoutMs;
+            while (true)
+            {
+                var sem = _keyLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+                if (!sem.Wait(timeoutMs < 0 ? Timeout.Infinite : (int)Math.Max(0, deadline - Environment.TickCount64)))
+                    return false;
+                if (_keyLocks.TryGetValue(key, out var current) && ReferenceEquals(current, sem))
+                    return true;
+                sem.Release();
+            }
         }
 
         /// <summary>
